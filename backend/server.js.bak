@@ -1,0 +1,399 @@
+const express = require("express");
+const cors = require("cors");
+
+const app = express();
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+app.use(cors());
+app.use(express.json({ limit: "5mb" })); // allow base64 evidence payloads
+
+// ─── Hugging Face Config ──────────────────────────────────────────────────────
+// distilbert-base-uncased-finetuned-sst-2-english  (fast, free for low usage)
+const HF_MODEL = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
+const HF_API_URL = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`;
+// Set HF_TOKEN env var for higher rate limits:  $env:HF_TOKEN="hf_xxxx"
+const HF_TOKEN = process.env.HF_TOKEN || "";
+
+// ─── Firebase Admin Config ────────────────────────────────────────────────────
+// The frontend already uses Firebase directly (Firestore + Auth).
+// The backend only needs Admin SDK if it must bypass security rules (e.g. escalation writes).
+// To enable: set FIREBASE_SERVICE_ACCOUNT env var to the JSON key file path.
+let adminDb = null;
+try {
+  const admin = require("firebase-admin");
+  if (!admin.apps.length) {
+    const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (serviceAccountPath) {
+      const serviceAccount = require(serviceAccountPath);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`,
+      });
+      adminDb = admin.firestore();
+      console.log("✅ Firebase Admin SDK initialized");
+    } else {
+      console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT not set — admin writes disabled (escalation endpoint will be skipped)");
+    }
+  }
+} catch (e) {
+  console.warn("⚠️  firebase-admin not installed — run `npm install firebase-admin` in /backend if needed.");
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Keyword-based incident categorisation used as both a signal booster and
+ * a fallback when the HuggingFace API is unavailable.
+ */
+function buildSentimentResult(hfLabel, hfScore, text, source) {
+  const lower = text.toLowerCase();
+
+  const isCritical = /fight|weapon|threat|hit|attack|assault|emergency|kill|stab|gun|blood/.test(lower);
+  const isModerate = /harass|angry|shout|rude|yell|abuse|bully|scream|curse|slap/.test(lower);
+  const isNuisance = /noise|loud|music|smell|garbage|litter|parking|block/.test(lower);
+
+  const label = (hfLabel || "NEUTRAL").toUpperCase();
+  const score = hfScore ?? 0.7;
+
+  let category = "General";
+  let riskLevel = "Low";
+  let priority = "Low";
+  let sentiment = "Neutral";
+  let suggestion = "Thank you for reporting this. A moderator will review it shortly.";
+  let department = "Community Peacebuilders";
+
+  if (isCritical) {
+    category = "Safety";
+    riskLevel = "Critical";
+    priority = "High";
+    sentiment = "Urgent";
+    department = "Local Police & Emergency Services";
+    suggestion = "This sounds serious. Please ensure your safety first. This has been flagged as urgent for immediate moderator review.";
+  } else if ((label === "NEGATIVE" || isCritical) && isModerate) {
+    category = "Dispute";
+    riskLevel = "Moderate";
+    priority = "Medium";
+    sentiment = "Negative";
+    department = "Neighborhood Watch / Peacebuilders";
+    suggestion = "We understand this is frustrating. Avoid direct confrontation. A mediator will be assigned.";
+  } else if (isNuisance) {
+    category = "Nuisance";
+    riskLevel = "Low";
+    priority = "Medium";
+    sentiment = "Negative";
+    department = "Municipal Corporation";
+    suggestion = "Nuisance complaints are noted. We will anonymously remind the community about guidelines.";
+  } else if (label === "NEGATIVE") {
+    category = "Complaint";
+    riskLevel = "Low";
+    priority = "Medium";
+    sentiment = "Negative";
+    department = "Neighborhood Watch / Peacebuilders";
+    suggestion = "Your concern has been noted and will be reviewed by a moderator soon.";
+  } else {
+    sentiment = "Positive";
+    suggestion = "Thank you for your report. It appears to be a general inquiry. A moderator will follow up.";
+  }
+
+  const confidence = `${Math.round(score * 100)}%`;
+  console.log(`✅ Sentiment [${source}]: ${label} (${confidence}) → ${category} / ${priority}`);
+
+  return { sentiment, category, riskLevel, priority, confidence, suggestion, department, aiSource: source, rawLabel: label, rawScore: score };
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+/** Health check */
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", message: "Harmony AI backend is running 🚀" });
+});
+
+// ── POST /api/sentiment ────────────────────────────────────────────────────────
+// Analyses incident text with HuggingFace SST-2; keyword fallback if HF fails.
+// Returns: { sentiment, category, riskLevel, priority, confidence, suggestion, department, aiSource }
+app.post("/api/sentiment", async (req, res) => {
+  const { text } = req.body;
+
+  if (!text || text.trim().length < 5) {
+    return res.status(400).json({ error: "Text too short for analysis" });
+  }
+
+  // ── Try HuggingFace first ─────────────────────────────────────────────
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (HF_TOKEN) headers["Authorization"] = `Bearer ${HF_TOKEN}`;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8 s
+
+    const hfRes = await fetch(HF_API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ inputs: text }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!hfRes.ok) {
+      console.warn(`⚠️  HF returned ${hfRes.status} — falling back to keywords`);
+      return res.json(buildSentimentResult(null, null, text, "keyword"));
+    }
+
+    const hfData = await hfRes.json();
+    const predictions = Array.isArray(hfData[0]) ? hfData[0] : hfData;
+    const top = predictions.reduce((a, b) => (a.score > b.score ? a : b));
+
+    return res.json(buildSentimentResult(top.label, top.score, text, "huggingface"));
+
+  } catch (err) {
+    console.warn("⚠️  HF call failed:", err.message, "— using keyword fallback");
+    return res.json(buildSentimentResult(null, null, text, "keyword"));
+  }
+});
+
+// ── POST /api/report ──────────────────────────────────────────────────────────
+// Accepts a fully-formed report object from the frontend and optionally writes
+// it to Firebase (if Admin SDK is available). Falls back to in-memory store.
+let reports = [];
+
+app.post("/api/report", async (req, res) => {
+  const data = req.body;
+  if (!data || !data.title) {
+    return res.status(400).json({ error: "title is required" });
+  }
+
+  const report = {
+    ...data,
+    displayId: data.displayId || `REP-${Math.floor(Math.random() * 10000).toString().padStart(4, "0")}`,
+    createdAt: new Date().toISOString(),
+    status: data.status || "pending",
+  };
+
+  // Try Admin SDK write
+  if (adminDb) {
+    try {
+      const ref = await adminDb.collection("reports").add({
+        ...report,
+        createdAt: require("firebase-admin").firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`📋 Report saved to Firestore: ${ref.id}`);
+      return res.json({ success: true, id: ref.id, displayId: report.displayId });
+    } catch (err) {
+      console.error("Firestore write failed:", err.message);
+      // fall through to in-memory
+    }
+  }
+
+  // In-memory fallback
+  reports.unshift(report);
+  console.log(`📋 Report stored in memory (total: ${reports.length})`);
+  res.json({ success: true, id: report.displayId, displayId: report.displayId });
+});
+
+// ── GET /api/reports ──────────────────────────────────────────────────────────
+// Returns in-memory reports (fallback only — real data lives in Firestore).
+app.get("/api/reports", (_req, res) => {
+  res.json(reports);
+});
+
+// ── POST /api/escalate ────────────────────────────────────────────────────────
+// Checks if a location label has ≥ 3 high-priority reports and escalates it.
+// Uses Admin SDK when available; otherwise returns a simulated result.
+app.post("/api/escalate", async (req, res) => {
+  const { location_label } = req.body;
+  if (!location_label) {
+    return res.status(400).json({ error: "location_label is required" });
+  }
+
+  if (!adminDb) {
+    console.warn("⚠️  Escalation skipped — Admin SDK not configured");
+    return res.json({ escalated: false, reason: "Admin SDK not configured" });
+  }
+
+  try {
+    const snapshot = await adminDb
+      .collection("reports")
+      .where("location_label", "==", location_label)
+      .where("priority", "==", "High")
+      .where("status", "in", ["pending", "in_progress", "reopened"])
+      .get();
+
+    const count = snapshot.size;
+    const shouldEscalate = count >= 3;
+
+    if (shouldEscalate) {
+      // Mark area as a hotspot in a dedicated collection
+      await adminDb.collection("hotspots").doc(location_label).set({
+        location_label,
+        reportCount: count,
+        escalatedAt: require("firebase-admin").firestore.FieldValue.serverTimestamp(),
+        active: true,
+      }, { merge: true });
+
+      console.log(`🔥 Hotspot escalated: "${location_label}" (${count} high-priority reports)`);
+    }
+
+    res.json({ escalated: shouldEscalate, reportCount: count, location_label });
+  } catch (err) {
+    console.error("Escalation error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/hotspots ─────────────────────────────────────────────────────────
+// Returns active escalated hotspot areas (used by the Area Explorer page).
+app.get("/api/hotspots", async (_req, res) => {
+  if (!adminDb) {
+    // Return mock hotspots for development
+    return res.json([
+      { location_label: "Metro Station North", reportCount: 5, active: true },
+      { location_label: "Central Park Area", reportCount: 3, active: true },
+      { location_label: "Bus Terminal East", reportCount: 4, active: true },
+    ]);
+  }
+
+  try {
+    const snapshot = await adminDb
+      .collection("hotspots")
+      .where("active", "==", true)
+      .orderBy("reportCount", "desc")
+      .limit(20)
+      .get();
+
+    const hotspots = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json(hotspots);
+  } catch (err) {
+    console.error("Error fetching hotspots:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/analytics ────────────────────────────────────────────────────────
+// Returns aggregated stats for the Analytics dashboard page.
+app.get("/api/analytics", async (_req, res) => {
+  if (!adminDb) {
+    // Return mock analytics when Admin SDK is not configured
+    return res.json({
+      total: 47,
+      pending: 12,
+      inProgress: 8,
+      resolved: 22,
+      completed: 18,
+      reopened: 4,
+      successRate: 82,
+      categoryBreakdown: [
+        { name: "Harassment", value: 45 },
+        { name: "Violence Risk", value: 30 },
+        { name: "Domestic Conflict", value: 15 },
+        { name: "Other", value: 10 },
+      ],
+      weeklyVolume: [
+        { name: "Mon", reports: 4, resolved: 3 },
+        { name: "Tue", reports: 7, resolved: 5 },
+        { name: "Wed", reports: 2, resolved: 2 },
+        { name: "Thu", reports: 5, resolved: 4 },
+        { name: "Fri", reports: 8, resolved: 6 },
+        { name: "Sat", reports: 12, resolved: 8 },
+        { name: "Sun", reports: 9, resolved: 7 },
+      ],
+    });
+  }
+
+  try {
+    const snapshot = await adminDb.collection("reports").get();
+    const all = snapshot.docs.map(d => d.data());
+
+    const total = all.length;
+    const pending = all.filter(r => r.status === "pending").length;
+    const inProgress = all.filter(r => r.status === "in_progress").length;
+    const resolved = all.filter(r => r.status === "resolved_by_moderator").length;
+    const completed = all.filter(r => r.status === "completed").length;
+    const reopened = all.filter(r => r.status === "reopened").length;
+
+    const attempts = completed + reopened;
+    const successRate = attempts === 0 ? 0 : Math.round((completed / attempts) * 100);
+
+    // Category breakdown
+    const catMap = {};
+    all.forEach(r => {
+      const cat = r.category || "Other";
+      catMap[cat] = (catMap[cat] || 0) + 1;
+    });
+    const categoryBreakdown = Object.entries(catMap).map(([name, value]) => ({ name, value }));
+
+    res.json({ total, pending, inProgress, resolved, completed, reopened, successRate, categoryBreakdown });
+  } catch (err) {
+    console.error("Analytics error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/area-explorer ────────────────────────────────────────────────────
+// Powers the Area Explorer page — returns reports grouped/enriched by area.
+app.get("/api/area-explorer", async (req, res) => {
+  const { lat, lng, radius = 2000 } = req.query; // radius in metres
+
+  if (!adminDb) {
+    return res.json({
+      areas: [
+        { name: "Metro Station North", lat: 12.9716, lng: 77.5946, reportCount: 5, riskLevel: "Critical" },
+        { name: "Central Park", lat: 12.9352, lng: 77.6245, reportCount: 3, riskLevel: "Moderate" },
+        { name: "Bus Terminal East", lat: 12.9800, lng: 77.6101, reportCount: 2, riskLevel: "Low" },
+        { name: "Market Square", lat: 12.9600, lng: 77.5900, reportCount: 4, riskLevel: "Moderate" },
+        { name: "Residential Block 7", lat: 12.9650, lng: 77.6000, reportCount: 1, riskLevel: "Low" },
+      ],
+    });
+  }
+
+  try {
+    const snapshot = await adminDb
+      .collection("reports")
+      .where("status", "in", ["pending", "in_progress", "reopened"])
+      .orderBy("createdAt", "desc")
+      .limit(200)
+      .get();
+
+    const all = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    // Group by location_label
+    const areaMap = {};
+    all.forEach(r => {
+      const name = r.location_label || "Unknown";
+      if (!areaMap[name]) areaMap[name] = { name, reports: [], lat: r.location?.lat, lng: r.location?.lng };
+      areaMap[name].reports.push(r);
+    });
+
+    const areas = Object.values(areaMap).map(a => {
+      const count = a.reports.length;
+      const hasHigh = a.reports.some(r => r.priority === "High");
+      const hasMed = a.reports.some(r => r.priority === "Medium");
+      return {
+        name: a.name,
+        lat: a.lat,
+        lng: a.lng,
+        reportCount: count,
+        riskLevel: hasHigh ? "Critical" : hasMed ? "Moderate" : "Low",
+      };
+    });
+
+    res.json({ areas });
+  } catch (err) {
+    console.error("Area explorer error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`\n🚀 Harmony AI backend running on http://localhost:${PORT}`);
+  console.log(`   Endpoints:`);
+  console.log(`     GET  /                   — health check`);
+  console.log(`     POST /api/sentiment      — AI incident analysis`);
+  console.log(`     POST /api/report         — submit a report`);
+  console.log(`     GET  /api/reports        — list in-memory reports`);
+  console.log(`     POST /api/escalate       — hotspot escalation check`);
+  console.log(`     GET  /api/hotspots       — active hotspot areas`);
+  console.log(`     GET  /api/analytics      — platform stats`);
+  console.log(`     GET  /api/area-explorer  — area-based report clusters\n`);
+});
